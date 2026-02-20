@@ -37,6 +37,43 @@ results = list(model.generate_custom_voice(
 audio = results[0].audio  # mx.array
 ```
 
+### Incremental CustomVoice Session (Append-Only)
+
+`mlx-audio` now supports incremental text append for CustomVoice, while staying on a
+single KV cache track with strict no-rollback semantics.
+
+```python
+from mlx_audio.tts.utils import load_model
+
+model = load_model("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16")
+
+session = model.start_custom_voice_session(
+    speaker="Vivian",
+    language="English",
+    stable_tail_tokens=4,
+    streaming_interval=2.0,
+)
+
+session.append_text("Hello there,")
+for chunk in session.pump():
+    audio = chunk.audio
+
+session.append_text(" this is streamed in the same session.")
+for chunk in session.pump():
+    audio = chunk.audio
+
+session.finalize_text()
+while not session.is_finished():
+    for chunk in session.pump():
+        audio = chunk.audio
+```
+
+Constraints:
+- Append-only text stream. Do not edit or replace previously appended text.
+- Strict no-rollback: already consumed text boundary must not change after retokenization.
+- `stable_tail_tokens` keeps a small unstable suffix to avoid boundary jitter crossing committed tokens.
+- First release covers `CustomVoice` only.
+
 ## VoiceDesign (Create Any Voice)
 
 Create any voice from a text description:

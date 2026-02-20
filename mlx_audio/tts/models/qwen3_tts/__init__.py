@@ -1,3 +1,13 @@
-from .qwen3_tts import Model, ModelConfig
+from .qwen3_tts import (
+    IncrementalCustomVoiceSession,
+    Model,
+    ModelConfig,
+    TokenizationMovedCommittedBoundaryError,
+)
 
-__all__ = ["Model", "ModelConfig"]
+__all__ = [
+    "Model",
+    "ModelConfig",
+    "IncrementalCustomVoiceSession",
+    "TokenizationMovedCommittedBoundaryError",
+]

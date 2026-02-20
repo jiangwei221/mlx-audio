@@ -1,11 +1,18 @@
 # Copyright (c) 2025, Prince Canuma and contributors (https://github.com/Blaizzy/mlx-audio)
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import numpy as np
 
-from mlx_audio.tts.models.qwen3_tts.qwen3_tts import mel_spectrogram
+from mlx_audio.tts.models.qwen3_tts.qwen3_tts import (
+    IncrementalCustomVoiceSession,
+    Model,
+    TokenizationMovedCommittedBoundaryError,
+    mel_spectrogram,
+)
 from mlx_audio.tts.models.qwen3_tts.speaker_encoder import (
     TimeDelayNetBlock,
     reflect_pad_1d,
@@ -328,6 +335,298 @@ class TestMelSpectrogram(unittest.TestCase):
             err_msg="mel_spectrogram output std should be ~0.37 with correct params. "
             f"Got std={mel_np.std():.4f}.",
         )
+
+
+class _FakeEmbedding:
+    def __init__(self, hidden_size: int):
+        self.hidden_size = hidden_size
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        ids = token_ids
+        if ids.ndim == 1:
+            ids = ids[None, :]
+        values = ids.astype(mx.float32)[..., None]
+        return mx.broadcast_to(values, (ids.shape[0], ids.shape[1], self.hidden_size))
+
+
+class _FakeCodePredictor:
+    def __init__(self, vocab_size: int, hidden_size: int, num_code_groups: int):
+        self.vocab_size = vocab_size
+        self.codec_embedding = [
+            _FakeEmbedding(hidden_size) for _ in range(num_code_groups - 1)
+        ]
+
+    def make_cache(self):
+        return {}
+
+    def __call__(self, input_embeds: mx.array, cache=None, generation_step: int = 0):
+        batch, seq_len, _ = input_embeds.shape
+        logits = mx.zeros((batch, seq_len, self.vocab_size), dtype=mx.float32)
+        return logits, cache, generation_step + 1
+
+
+class _FakeTalker:
+    def __init__(self, vocab_size: int, hidden_size: int, num_code_groups: int):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self._input_embedding = _FakeEmbedding(hidden_size)
+        self.code_predictor = _FakeCodePredictor(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            num_code_groups=num_code_groups,
+        )
+
+    def make_cache(self):
+        return {}
+
+    def get_input_embeddings(self):
+        return self._input_embedding
+
+    def __call__(self, input_embeds: mx.array, cache=None):
+        batch, seq_len, _ = input_embeds.shape
+        logits = mx.zeros((batch, seq_len, self.vocab_size), dtype=mx.float32)
+        hidden = mx.zeros((batch, seq_len, self.hidden_size), dtype=mx.float32)
+        return logits, hidden
+
+
+class _FakeIncrementalModel:
+    def __init__(
+        self,
+        tokenization_map: dict,
+        primary_tokens: list[int],
+        eos_token_id: int = 63,
+        num_code_groups: int = 2,
+        hidden_size: int = 8,
+        vocab_size: int = 64,
+    ):
+        self._tokenization_map = tokenization_map
+        self._primary_tokens = list(primary_tokens)
+        self._secondary_token = 7
+        self._hidden_size = hidden_size
+
+        self.config = SimpleNamespace(
+            talker_config=SimpleNamespace(
+                codec_eos_token_id=eos_token_id,
+                num_code_groups=num_code_groups,
+                vocab_size=vocab_size,
+            )
+        )
+        self.sample_rate = 24000
+        self.speech_tokenizer = SimpleNamespace(decode_upsample_rate=1)
+        self.talker = _FakeTalker(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            num_code_groups=num_code_groups,
+        )
+
+    def _build_custom_voice_session_context(
+        self,
+        speaker: str,
+        language: str = "auto",
+        instruct: str | None = None,
+    ):
+        base = mx.zeros((1, 1, self._hidden_size), dtype=mx.float32)
+        return {
+            "prefill_prefix": base,
+            "codec_suffix": base,
+            "tts_pad_embed": base,
+            "tts_eos_embed": mx.ones((1, 1, self._hidden_size), dtype=mx.float32),
+            "suppress_tokens": mx.array([], dtype=mx.int32),
+        }
+
+    def _tokenize_chat_body_ids(self, text: str):
+        if text not in self._tokenization_map:
+            return []
+        return list(self._tokenization_map[text])
+
+    def _embed_body_text_token_ids(self, token_ids: list[int]):
+        return [
+            mx.full((1, 1, self._hidden_size), float(token_id), dtype=mx.float32)
+            for token_id in token_ids
+        ]
+
+    def _sample_token(self, logits: mx.array, suppress_tokens=None, eos_token_id=None, **_):
+        if suppress_tokens is not None:
+            if self._primary_tokens:
+                token = self._primary_tokens.pop(0)
+            else:
+                token = eos_token_id
+            return mx.array([[token]], dtype=mx.int32)
+        return mx.array([[self._secondary_token]], dtype=mx.int32)
+
+    def _decode_chunk(self, codes: mx.array, chunk_tokens: int = 100):
+        del chunk_tokens
+        first_codebook = np.array(codes)[0, :, 0].astype(np.float32)
+        return mx.array(first_codebook)
+
+
+class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
+    def _new_session(self, model: _FakeIncrementalModel, stable_tail_tokens: int = 1):
+        return IncrementalCustomVoiceSession(
+            model=model,
+            speaker="vivian",
+            stable_tail_tokens=stable_tail_tokens,
+            streaming_interval=0.08,  # Force 1 token streaming chunks in tests.
+            max_codec_steps_total=32,
+        )
+
+    def test_basic_incremental_flow_wait_resume_and_finalize(self):
+        tokenization_map = {
+            "A": [11, 12],
+            "AB": [11, 12, 13, 14],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[21, 22, 23, 63],
+        )
+        session = self._new_session(model, stable_tail_tokens=1)
+
+        session.append_text("A")
+        first_results = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(first_results), 1)
+        self.assertTrue(session.is_waiting_text())
+        self.assertEqual(session.status()["consumed_text_tokens"], 1)
+
+        first_hashes = [hash(np.array(r.audio).tobytes()) for r in first_results]
+
+        session.append_text("B")
+        second_results = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(second_results), 1)
+        self.assertFalse(session.is_waiting_text())
+        self.assertEqual(
+            first_hashes, [hash(np.array(r.audio).tobytes()) for r in first_results]
+        )
+
+        session.finalize_text()
+        for _ in range(10):
+            if session.is_finished():
+                break
+            list(session.pump(max_codec_steps=1))
+        self.assertTrue(session.is_finished())
+
+    def test_tokenization_change_in_unconsumed_region_is_allowed(self):
+        tokenization_map = {
+            "M": [10, 20],
+            "MN": [10, 99, 100],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[31, 32, 63],
+        )
+        session = self._new_session(model, stable_tail_tokens=1)
+
+        session.append_text("M")
+        list(session.pump(max_codec_steps=1))
+        session.append_text("N")
+
+        self.assertEqual(session.consumed_text_tokens, 1)
+        self.assertEqual(session.all_text_ids[:2], [10, 99])
+        self.assertGreater(session.status()["pending_tokens"], 0)
+
+    def test_tokenization_change_crossing_committed_boundary_raises(self):
+        tokenization_map = {
+            "X": [10, 20],
+            "XY": [77, 20, 30],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[41, 63],
+        )
+        session = self._new_session(model, stable_tail_tokens=1)
+
+        session.append_text("X")
+        list(session.pump(max_codec_steps=1))
+
+        with self.assertRaises(TokenizationMovedCommittedBoundaryError):
+            session.append_text("Y")
+
+    def test_waiting_text_then_resume_after_append(self):
+        tokenization_map = {
+            "a": [1, 2],
+            "ab": [1, 2, 3, 4, 5],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[51, 52, 63],
+        )
+        session = self._new_session(model, stable_tail_tokens=4)
+
+        session.append_text("a")
+        self.assertEqual(list(session.pump(max_codec_steps=1)), [])
+        self.assertTrue(session.is_waiting_text())
+        self.assertFalse(session.is_finished())
+
+        session.append_text("b")
+        resumed = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(resumed), 1)
+
+    def test_generate_custom_voice_incremental_wrapper(self):
+        class _MockSession:
+            def __init__(self):
+                self.appended = []
+                self.finalized = False
+                self.finished = False
+                self._pump_calls = 0
+
+            def append_text(self, chunk: str):
+                self.appended.append(chunk)
+
+            def finalize_text(self):
+                self.finalized = True
+
+            def pump(self, max_codec_steps=None):
+                del max_codec_steps
+                self._pump_calls += 1
+                if self._pump_calls <= len(self.appended):
+                    yield f"chunk-{self._pump_calls}"
+                    return
+                if self.finalized and not self.finished:
+                    self.finished = True
+                    yield "final"
+
+            def is_waiting_text(self):
+                return False
+
+            def is_finished(self):
+                return self.finished
+
+        mock_session = _MockSession()
+        fake_model = SimpleNamespace(
+            start_custom_voice_session=MagicMock(return_value=mock_session)
+        )
+
+        outputs = list(
+            Model.generate_custom_voice_incremental(
+                fake_model,
+                text_chunks=["first", "second"],
+                speaker="vivian",
+            )
+        )
+
+        self.assertEqual(outputs, ["chunk-1", "chunk-2", "final"])
+        self.assertEqual(mock_session.appended, ["first", "second"])
+        self.assertTrue(mock_session.finalized)
+        fake_model.start_custom_voice_session.assert_called_once()
+
+    def test_generate_custom_voice_compatibility_smoke(self):
+        fake_model = SimpleNamespace(
+            config=SimpleNamespace(tts_model_type="custom_voice", tts_model_size="1b7"),
+            supported_speakers=["Vivian"],
+            _generate_with_instruct=MagicMock(return_value=iter(["ok"])),
+        )
+
+        result = list(
+            Model.generate_custom_voice(
+                fake_model,
+                text="hello",
+                speaker="vivian",
+                language="auto",
+                instruct=None,
+            )
+        )
+
+        self.assertEqual(result, ["ok"])
+        fake_model._generate_with_instruct.assert_called_once()
 
 
 if __name__ == "__main__":

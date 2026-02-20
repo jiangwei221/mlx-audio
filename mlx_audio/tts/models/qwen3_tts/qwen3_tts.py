@@ -3,7 +3,7 @@
 import json
 import time
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Tuple, Union
+from typing import Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -134,6 +134,10 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
 
+class TokenizationMovedCommittedBoundaryError(RuntimeError):
+    """Raised when retokenization modifies text that has already been consumed."""
+
+
 class Model(nn.Module):
 
     def __init__(self, config: ModelConfig):
@@ -194,6 +198,227 @@ class Model(nn.Module):
     def get_supported_languages(self) -> List[str]:
         """Get list of supported language codes."""
         return self.supported_languages
+
+    def _tokenize_chat_body_ids(self, text: str) -> List[int]:
+        """Tokenize chat template and return only assistant body token ids."""
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+        chat_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        token_ids = self.tokenizer.encode(chat_text)
+        return list(token_ids[3:-5])
+
+    def _embed_body_text_token_ids(self, token_ids: List[int]) -> List[mx.array]:
+        """Embed body token ids into per-token hidden states."""
+        if not token_ids:
+            return []
+        token_arr = mx.array([token_ids], dtype=mx.int32)
+        text_embed = self.talker.text_projection(
+            self.talker.get_text_embeddings()(token_arr)
+        )
+        mx.eval(text_embed)
+        return [text_embed[:, i : i + 1, :] for i in range(text_embed.shape[1])]
+
+    def _build_custom_voice_session_context(
+        self,
+        speaker: str,
+        language: str = "auto",
+        instruct: Optional[str] = None,
+    ) -> Dict[str, mx.array]:
+        """Build reusable prompt embeddings for incremental CustomVoice sessions."""
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+
+        config = self.config.talker_config
+        speaker_key = speaker.lower()
+        if speaker_key not in (config.spk_id or {}):
+            raise ValueError(
+                f"Speaker '{speaker}' not supported. Available: {self.supported_speakers}"
+            )
+
+        language_key = language.lower()
+        language_id = None
+        if language_key != "auto":
+            if language_key not in (config.codec_language_id or {}):
+                raise ValueError(
+                    f"Language '{language}' not supported. Available: {self.supported_languages}"
+                )
+            language_id = config.codec_language_id[language_key]
+
+        if (
+            language_key in ["chinese", "auto"]
+            and speaker_key in (config.spk_is_dialect or {})
+            and config.spk_is_dialect[speaker_key]
+        ):
+            dialect = config.spk_is_dialect[speaker_key]
+            if dialect in (config.codec_language_id or {}):
+                language_id = config.codec_language_id[dialect]
+
+        # Special TTS token embeddings
+        tts_tokens = mx.array(
+            [
+                [
+                    self.config.tts_bos_token_id,
+                    self.config.tts_eos_token_id,
+                    self.config.tts_pad_token_id,
+                ]
+            ]
+        )
+        tts_embeds = self.talker.text_projection(
+            self.talker.get_text_embeddings()(tts_tokens)
+        )
+        tts_bos_embed = tts_embeds[:, 0:1, :]
+        tts_eos_embed = tts_embeds[:, 1:2, :]
+        tts_pad_embed = tts_embeds[:, 2:3, :]
+
+        # Language/speaker codec prefix
+        if language_id is None:
+            codec_prefill = [
+                config.codec_nothink_id,
+                config.codec_think_bos_id,
+                config.codec_think_eos_id,
+            ]
+        else:
+            codec_prefill = [
+                config.codec_think_id,
+                config.codec_think_bos_id,
+                language_id,
+                config.codec_think_eos_id,
+            ]
+
+        codec_embed = self.talker.get_input_embeddings()(mx.array([codec_prefill]))
+        speaker_embed = self.talker.get_input_embeddings()(
+            mx.array([[config.spk_id[speaker_key]]])
+        )
+        codec_suffix = self.talker.get_input_embeddings()(
+            mx.array([[config.codec_pad_id, config.codec_bos_id]])
+        )
+        codec_embed = mx.concatenate([codec_embed, speaker_embed, codec_suffix], axis=1)
+
+        pad_count = codec_embed.shape[1] - 2
+        pad_embeds = mx.broadcast_to(
+            tts_pad_embed, (1, pad_count, tts_pad_embed.shape[-1])
+        )
+        combined_embed = mx.concatenate([pad_embeds, tts_bos_embed], axis=1)
+        combined_embed = combined_embed + codec_embed[:, :-1, :]
+
+        role_ids = mx.array(self.tokenizer.encode("<|im_start|>assistant\n"))[None, :]
+        role_embed = self.talker.text_projection(
+            self.talker.get_text_embeddings()(role_ids)
+        )
+
+        prompt_parts = []
+        if instruct:
+            instruct_text = f"<|im_start|>user\n{instruct}<|im_end|>\n"
+            instruct_ids = mx.array(self.tokenizer.encode(instruct_text))[None, :]
+            instruct_embed = self.talker.text_projection(
+                self.talker.get_text_embeddings()(instruct_ids)
+            )
+            prompt_parts.append(instruct_embed)
+        prompt_parts.extend([role_embed, combined_embed])
+        prefill_prefix = mx.concatenate(prompt_parts, axis=1)
+
+        suppress_tokens = [
+            i
+            for i in range(config.vocab_size - 1024, config.vocab_size)
+            if i != config.codec_eos_token_id
+        ]
+        return {
+            "prefill_prefix": prefill_prefix,
+            "codec_suffix": codec_embed[:, -1:, :],
+            "tts_pad_embed": tts_pad_embed,
+            "tts_eos_embed": tts_eos_embed,
+            "suppress_tokens": mx.array(suppress_tokens, dtype=mx.int32),
+        }
+
+    def start_custom_voice_session(
+        self,
+        speaker: str,
+        language: str = "auto",
+        instruct: Optional[str] = None,
+        stable_tail_tokens: int = 4,
+        streaming_interval: float = 2.0,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.05,
+        max_codec_steps_total: int = 4096,
+    ) -> "IncrementalCustomVoiceSession":
+        """Start an incremental CustomVoice generation session."""
+        if self.config.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"Model type '{self.config.tts_model_type}' does not support incremental CustomVoice sessions."
+            )
+        if speaker.lower() not in [s.lower() for s in self.supported_speakers]:
+            raise ValueError(
+                f"Speaker '{speaker}' not supported. Available: {self.supported_speakers}"
+            )
+        if self.speech_tokenizer is None:
+            raise ValueError("Speech tokenizer not loaded")
+        if stable_tail_tokens < 0:
+            raise ValueError("stable_tail_tokens must be >= 0")
+        if max_codec_steps_total <= 0:
+            raise ValueError("max_codec_steps_total must be > 0")
+
+        return IncrementalCustomVoiceSession(
+            model=self,
+            speaker=speaker,
+            language=language,
+            instruct=instruct,
+            stable_tail_tokens=stable_tail_tokens,
+            streaming_interval=streaming_interval,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_codec_steps_total=max_codec_steps_total,
+        )
+
+    def generate_custom_voice_incremental(
+        self,
+        text_chunks: Iterable[str],
+        speaker: str,
+        language: str = "auto",
+        instruct: Optional[str] = None,
+        stable_tail_tokens: int = 4,
+        streaming_interval: float = 2.0,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.05,
+        max_codec_steps_total: int = 4096,
+        max_codec_steps_per_pump: Optional[int] = None,
+    ) -> Generator[GenerationResult, None, None]:
+        """Convenience generator for incremental CustomVoice synthesis."""
+        session = self.start_custom_voice_session(
+            speaker=speaker,
+            language=language,
+            instruct=instruct,
+            stable_tail_tokens=stable_tail_tokens,
+            streaming_interval=streaming_interval,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_codec_steps_total=max_codec_steps_total,
+        )
+
+        if isinstance(text_chunks, str):
+            text_iterable = [text_chunks]
+        else:
+            text_iterable = text_chunks
+
+        for chunk in text_iterable:
+            session.append_text(chunk)
+            yield from session.pump(max_codec_steps=max_codec_steps_per_pump)
+
+        session.finalize_text()
+        while not session.is_finished():
+            yielded = False
+            for result in session.pump(max_codec_steps=max_codec_steps_per_pump):
+                yielded = True
+                yield result
+            if not yielded and session.is_waiting_text():
+                break
 
     def model_quant_predicate(self, path: str, module) -> bool:
 
@@ -1956,3 +2181,369 @@ class Model(nn.Module):
             sanitized[new_key] = v
 
         return sanitized
+
+
+class IncrementalCustomVoiceSession:
+    """Incremental CustomVoice generation session with strict no-rollback semantics."""
+
+    _TOKENS_PER_SECOND = 12.5
+    _CONTEXT_SIZE = 25
+
+    def __init__(
+        self,
+        model: Model,
+        speaker: str,
+        language: str = "auto",
+        instruct: Optional[str] = None,
+        stable_tail_tokens: int = 4,
+        streaming_interval: float = 2.0,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.05,
+        max_codec_steps_total: int = 4096,
+    ) -> None:
+        self.model = model
+        self.speaker = speaker
+        self.language = language
+        self.instruct = instruct
+        self.stable_tail_tokens = stable_tail_tokens
+        self.streaming_interval = streaming_interval
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
+        self.max_codec_steps_total = max_codec_steps_total
+
+        context = self.model._build_custom_voice_session_context(
+            speaker=speaker,
+            language=language,
+            instruct=instruct,
+        )
+        self._prefill_prefix = context["prefill_prefix"]
+        self._codec_suffix = context["codec_suffix"]
+        self._tts_pad_embed = context["tts_pad_embed"]
+        self._tts_eos_embed = context["tts_eos_embed"]
+        self._suppress_tokens = context["suppress_tokens"]
+
+        self._config = self.model.config.talker_config
+        self._sample_rate = int(getattr(self.model, "sample_rate", 24000))
+        self._streaming_chunk_size = max(
+            1, int(self.streaming_interval * self._TOKENS_PER_SECOND)
+        )
+
+        self.full_text = ""
+        self.all_text_ids: List[int] = []
+        self.consumed_text_tokens = 0
+
+        self._pending_token_ids: List[int] = []
+        self._pending_text_embeds: List[mx.array] = []
+
+        self.text_finalized = False
+        self._eos_text_consumed = False
+        self.eos_reached = False
+        self.waiting_text = False
+
+        self.cache = None
+        self.next_input_embeds: Optional[mx.array] = None
+        self._next_codec_embed: Optional[mx.array] = None
+
+        self.generated_codes: List[mx.array] = []
+        self.decoded_tokens = 0
+        self._codec_steps_generated = 0
+
+    def append_text(self, chunk: str) -> None:
+        """Append text and rebuild pending stable token embeddings."""
+        if self.text_finalized:
+            raise RuntimeError("Cannot append text after finalize_text().")
+        if self.eos_reached:
+            raise RuntimeError("Session already finished.")
+        if not chunk:
+            return
+
+        self.full_text += chunk
+        new_token_ids = self.model._tokenize_chat_body_ids(self.full_text)
+        self._validate_committed_prefix(new_token_ids)
+        self.all_text_ids = new_token_ids
+        self._refresh_pending_from_all_text_ids()
+
+    def finalize_text(self) -> None:
+        """Mark text stream complete and make all remaining tokens consumable."""
+        if self.text_finalized:
+            return
+        self.text_finalized = True
+        self._refresh_pending_from_all_text_ids()
+
+    def is_waiting_text(self) -> bool:
+        return self.waiting_text and not self.eos_reached
+
+    def is_finished(self) -> bool:
+        return self.eos_reached
+
+    def status(self) -> Dict[str, Union[int, bool]]:
+        return {
+            "consumed_text_tokens": self.consumed_text_tokens,
+            "pending_tokens": len(self._pending_token_ids),
+            "finalized": self.text_finalized,
+            "eos_reached": self.eos_reached,
+            "waiting_text": self.waiting_text,
+            "total_text_tokens": len(self.all_text_ids),
+        }
+
+    def pump(
+        self, max_codec_steps: Optional[int] = None
+    ) -> Generator[GenerationResult, None, None]:
+        """Advance generation on the current single-track cache."""
+        if self.eos_reached:
+            return
+        if max_codec_steps is not None and max_codec_steps <= 0:
+            return
+
+        self._resume_from_waiting_if_possible()
+
+        if self.next_input_embeds is None:
+            self._bootstrap_if_ready()
+            if self.next_input_embeds is None:
+                return
+
+        steps = 0
+        while not self.eos_reached:
+            if max_codec_steps is not None and steps >= max_codec_steps:
+                break
+
+            all_codes, codec_embed = self._run_codec_step()
+            if self.eos_reached:
+                yield from self._emit_remaining_chunks(is_final_chunk=True)
+                break
+            if all_codes is None or codec_embed is None:
+                break
+
+            self.generated_codes.append(all_codes)
+            steps += 1
+
+            yield from self._emit_progress_chunks()
+            self._prepare_next_input(codec_embed)
+
+            if self.waiting_text:
+                break
+
+    def _validate_committed_prefix(self, new_token_ids: List[int]) -> None:
+        if self.consumed_text_tokens > len(new_token_ids):
+            raise TokenizationMovedCommittedBoundaryError(
+                "Retokenization shortened text below the committed boundary."
+            )
+        if (
+            self.all_text_ids[: self.consumed_text_tokens]
+            != new_token_ids[: self.consumed_text_tokens]
+        ):
+            raise TokenizationMovedCommittedBoundaryError(
+                "Retokenization changed committed text tokens."
+            )
+
+    def _refresh_pending_from_all_text_ids(self) -> None:
+        stable_len = len(self.all_text_ids)
+        if not self.text_finalized:
+            stable_len = max(0, stable_len - self.stable_tail_tokens)
+
+        if stable_len < self.consumed_text_tokens:
+            raise TokenizationMovedCommittedBoundaryError(
+                "Stable token window moved before committed boundary."
+            )
+
+        self._pending_token_ids = self.all_text_ids[self.consumed_text_tokens : stable_len]
+        self._pending_text_embeds = self.model._embed_body_text_token_ids(
+            self._pending_token_ids
+        )
+
+    def _consume_next_text_embed(self) -> Optional[mx.array]:
+        if self._pending_text_embeds:
+            self._pending_token_ids.pop(0)
+            embed = self._pending_text_embeds.pop(0)
+            self.consumed_text_tokens += 1
+            return embed
+        if self.text_finalized and not self._eos_text_consumed:
+            self._eos_text_consumed = True
+            return self._tts_eos_embed
+        return None
+
+    def _bootstrap_if_ready(self) -> None:
+        if self.cache is None:
+            self.cache = self.model.talker.make_cache()
+
+        first_text_embed = self._consume_next_text_embed()
+        if first_text_embed is None:
+            if self.text_finalized and len(self.all_text_ids) == 0:
+                # Empty finalized input yields no speech.
+                self.eos_reached = True
+                self.waiting_text = False
+            else:
+                self.waiting_text = True
+            return
+
+        self.waiting_text = False
+        self.next_input_embeds = mx.concatenate(
+            [self._prefill_prefix, first_text_embed + self._codec_suffix], axis=1
+        )
+        mx.eval(self.next_input_embeds)
+
+    def _resume_from_waiting_if_possible(self) -> None:
+        if not self.waiting_text:
+            return
+        if self._next_codec_embed is None:
+            return
+
+        text_embed = self._consume_next_text_embed()
+        if text_embed is None:
+            return
+
+        self.next_input_embeds = text_embed + self._next_codec_embed
+        mx.eval(self.next_input_embeds)
+        self.waiting_text = False
+
+    def _run_codec_step(self) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+        if self.next_input_embeds is None:
+            return None, None
+        if self._codec_steps_generated >= self.max_codec_steps_total:
+            self.eos_reached = True
+            return None, None
+
+        logits, hidden = self.model.talker(self.next_input_embeds, cache=self.cache)
+        next_token = self.model._sample_token(
+            logits,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            generated_tokens=(
+                [int(c[0, 0]) for c in self.generated_codes]
+                if self.generated_codes
+                else None
+            ),
+            suppress_tokens=self._suppress_tokens.tolist(),
+            eos_token_id=self._config.codec_eos_token_id,
+        )
+
+        if int(next_token[0, 0]) == self._config.codec_eos_token_id:
+            self.eos_reached = True
+            return None, None
+
+        code_tokens = [next_token]
+        code_hidden = hidden[:, -1:, :]
+        code_cache = self.model.talker.code_predictor.make_cache()
+
+        for code_idx in range(self._config.num_code_groups - 1):
+            if code_idx == 0:
+                code_0_embed = self.model.talker.get_input_embeddings()(next_token)
+                code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
+            else:
+                code_embed = self.model.talker.code_predictor.codec_embedding[
+                    code_idx - 1
+                ](code_tokens[-1])
+                code_input = code_embed
+
+            code_logits, code_cache, _ = self.model.talker.code_predictor(
+                code_input,
+                cache=code_cache,
+                generation_step=code_idx,
+            )
+            next_code = self.model._sample_token(
+                code_logits,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+            )
+            code_tokens.append(next_code)
+
+        all_codes = mx.concatenate(code_tokens, axis=1)
+        codec_embed = self.model.talker.get_input_embeddings()(next_token)
+        for i, code in enumerate(code_tokens[1:]):
+            codec_embed = codec_embed + self.model.talker.code_predictor.codec_embedding[
+                i
+            ](code)
+
+        del code_cache
+        mx.clear_cache()
+
+        self._codec_steps_generated += 1
+        return all_codes, codec_embed
+
+    def _prepare_next_input(self, codec_embed: mx.array) -> None:
+        text_embed = self._consume_next_text_embed()
+        if text_embed is None:
+            text_embed = self._tts_pad_embed
+            self.waiting_text = not self.text_finalized
+        else:
+            self.waiting_text = False
+
+        self._next_codec_embed = codec_embed
+        self.next_input_embeds = text_embed + codec_embed
+        mx.eval(self.next_input_embeds)
+
+    def _emit_progress_chunks(self) -> Generator[GenerationResult, None, None]:
+        new_tokens = len(self.generated_codes) - self.decoded_tokens
+        if new_tokens < self._streaming_chunk_size:
+            return
+
+        start_idx = max(0, self.decoded_tokens - self._CONTEXT_SIZE)
+        codes_chunk = mx.stack(self.generated_codes[start_idx:], axis=1)
+        mx.eval(codes_chunk)
+        audio_chunk = self.model._decode_chunk(
+            codes_chunk, chunk_tokens=self._streaming_chunk_size
+        )
+
+        if self.decoded_tokens > 0 and start_idx < self.decoded_tokens:
+            context_tokens = self.decoded_tokens - start_idx
+            samples_per_token = self.model.speech_tokenizer.decode_upsample_rate
+            trim_samples = context_tokens * samples_per_token
+            if trim_samples < audio_chunk.shape[0]:
+                audio_chunk = audio_chunk[trim_samples:]
+
+        self.decoded_tokens = len(self.generated_codes)
+        yield self._build_streaming_result(audio_chunk, new_tokens, is_final_chunk=False)
+
+    def _emit_remaining_chunks(
+        self, is_final_chunk: bool
+    ) -> Generator[GenerationResult, None, None]:
+        if len(self.generated_codes) <= self.decoded_tokens:
+            return
+
+        start_idx = max(0, self.decoded_tokens - self._CONTEXT_SIZE)
+        codes_chunk = mx.stack(self.generated_codes[start_idx:], axis=1)
+        mx.eval(codes_chunk)
+        audio_chunk = self.model._decode_chunk(
+            codes_chunk, chunk_tokens=self._streaming_chunk_size
+        )
+
+        if self.decoded_tokens > 0 and start_idx < self.decoded_tokens:
+            context_tokens = self.decoded_tokens - start_idx
+            samples_per_token = self.model.speech_tokenizer.decode_upsample_rate
+            trim_samples = context_tokens * samples_per_token
+            if trim_samples < audio_chunk.shape[0]:
+                audio_chunk = audio_chunk[trim_samples:]
+
+        new_tokens = len(self.generated_codes) - self.decoded_tokens
+        self.decoded_tokens = len(self.generated_codes)
+        yield self._build_streaming_result(
+            audio_chunk, new_tokens, is_final_chunk=is_final_chunk
+        )
+
+    def _build_streaming_result(
+        self, audio_chunk: mx.array, token_count: int, is_final_chunk: bool
+    ) -> GenerationResult:
+        samples = int(audio_chunk.shape[0])
+        duration = samples / self._sample_rate if self._sample_rate > 0 else 0.0
+        return GenerationResult(
+            audio=audio_chunk,
+            samples=samples,
+            sample_rate=self._sample_rate,
+            segment_idx=0,
+            token_count=token_count,
+            audio_duration=format_duration(duration),
+            real_time_factor=0,
+            prompt={"tokens": token_count, "tokens-per-sec": 0},
+            audio_samples={"samples": samples, "samples-per-sec": 0},
+            processing_time_seconds=0,
+            peak_memory_usage=mx.get_peak_memory() / 1e9,
+            is_streaming_chunk=True,
+            is_final_chunk=is_final_chunk,
+        )
