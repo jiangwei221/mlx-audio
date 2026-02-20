@@ -1,9 +1,10 @@
 # Copyright (c) 2025, Prince Canuma and contributors (https://github.com/Blaizzy/mlx-audio)
 
 import json
+import math
 import time
 from pathlib import Path
-from typing import Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Generator, Iterable, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -322,6 +323,14 @@ class Model(nn.Module):
             for i in range(config.vocab_size - 1024, config.vocab_size)
             if i != config.codec_eos_token_id
         ]
+        for token_id in (
+            getattr(config, "codec_pad_id", None),
+            getattr(config, "codec_bos_id", None),
+        ):
+            if token_id is None:
+                continue
+            if token_id != config.codec_eos_token_id and token_id not in suppress_tokens:
+                suppress_tokens.append(int(token_id))
         return {
             "prefill_prefix": prefill_prefix,
             "codec_suffix": codec_embed[:, -1:, :],
@@ -337,6 +346,9 @@ class Model(nn.Module):
         instruct: Optional[str] = None,
         stable_tail_tokens: int = 4,
         streaming_interval: float = 2.0,
+        waiting_text_strategy: Literal["pause", "pad", "pause_catchup"] = "pause_catchup",
+        catchup_target_codec_per_text: float = 2.0,
+        catchup_max_steps_per_wait: int = 2,
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
@@ -356,6 +368,14 @@ class Model(nn.Module):
             raise ValueError("Speech tokenizer not loaded")
         if stable_tail_tokens < 0:
             raise ValueError("stable_tail_tokens must be >= 0")
+        if waiting_text_strategy not in ("pause", "pad", "pause_catchup"):
+            raise ValueError(
+                "waiting_text_strategy must be one of: 'pause', 'pad', 'pause_catchup'"
+            )
+        if catchup_target_codec_per_text <= 0:
+            raise ValueError("catchup_target_codec_per_text must be > 0")
+        if catchup_max_steps_per_wait < 0:
+            raise ValueError("catchup_max_steps_per_wait must be >= 0")
         if max_codec_steps_total <= 0:
             raise ValueError("max_codec_steps_total must be > 0")
 
@@ -366,6 +386,9 @@ class Model(nn.Module):
             instruct=instruct,
             stable_tail_tokens=stable_tail_tokens,
             streaming_interval=streaming_interval,
+            waiting_text_strategy=waiting_text_strategy,
+            catchup_target_codec_per_text=catchup_target_codec_per_text,
+            catchup_max_steps_per_wait=catchup_max_steps_per_wait,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -381,6 +404,9 @@ class Model(nn.Module):
         instruct: Optional[str] = None,
         stable_tail_tokens: int = 4,
         streaming_interval: float = 2.0,
+        waiting_text_strategy: Literal["pause", "pad", "pause_catchup"] = "pause_catchup",
+        catchup_target_codec_per_text: float = 2.0,
+        catchup_max_steps_per_wait: int = 2,
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
@@ -395,6 +421,9 @@ class Model(nn.Module):
             instruct=instruct,
             stable_tail_tokens=stable_tail_tokens,
             streaming_interval=streaming_interval,
+            waiting_text_strategy=waiting_text_strategy,
+            catchup_target_codec_per_text=catchup_target_codec_per_text,
+            catchup_max_steps_per_wait=catchup_max_steps_per_wait,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -2197,6 +2226,9 @@ class IncrementalCustomVoiceSession:
         instruct: Optional[str] = None,
         stable_tail_tokens: int = 4,
         streaming_interval: float = 2.0,
+        waiting_text_strategy: Literal["pause", "pad", "pause_catchup"] = "pause_catchup",
+        catchup_target_codec_per_text: float = 2.0,
+        catchup_max_steps_per_wait: int = 2,
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
@@ -2209,11 +2241,22 @@ class IncrementalCustomVoiceSession:
         self.instruct = instruct
         self.stable_tail_tokens = stable_tail_tokens
         self.streaming_interval = streaming_interval
+        self.waiting_text_strategy = waiting_text_strategy
+        self.catchup_target_codec_per_text = catchup_target_codec_per_text
+        self.catchup_max_steps_per_wait = catchup_max_steps_per_wait
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.max_codec_steps_total = max_codec_steps_total
+        if self.waiting_text_strategy not in ("pause", "pad", "pause_catchup"):
+            raise ValueError(
+                "waiting_text_strategy must be one of: 'pause', 'pad', 'pause_catchup'"
+            )
+        if self.catchup_target_codec_per_text <= 0:
+            raise ValueError("catchup_target_codec_per_text must be > 0")
+        if self.catchup_max_steps_per_wait < 0:
+            raise ValueError("catchup_max_steps_per_wait must be >= 0")
 
         context = self.model._build_custom_voice_session_context(
             speaker=speaker,
@@ -2225,6 +2268,7 @@ class IncrementalCustomVoiceSession:
         self._tts_pad_embed = context["tts_pad_embed"]
         self._tts_eos_embed = context["tts_eos_embed"]
         self._suppress_tokens = context["suppress_tokens"]
+        self._suppress_tokens_list = self._suppress_tokens.tolist()
 
         self._config = self.model.config.talker_config
         self._sample_rate = int(getattr(self.model, "sample_rate", 24000))
@@ -2243,14 +2287,20 @@ class IncrementalCustomVoiceSession:
         self._eos_text_consumed = False
         self.eos_reached = False
         self.waiting_text = False
+        self.paused_for_text = False
 
         self.cache = None
         self.next_input_embeds: Optional[mx.array] = None
         self._next_codec_embed: Optional[mx.array] = None
 
         self.generated_codes: List[mx.array] = []
+        self._generated_first_code_tokens: List[int] = []
         self.decoded_tokens = 0
         self._codec_steps_generated = 0
+        self._wait_pause_step_target: Optional[int] = None
+        self._wait_pause_start_step: Optional[int] = None
+        self._catchup_steps_total = 0
+        self._catchup_steps_current_wait = 0
 
     def append_text(self, chunk: str) -> None:
         """Append text and rebuild pending stable token embeddings."""
@@ -2272,6 +2322,7 @@ class IncrementalCustomVoiceSession:
         if self.text_finalized:
             return
         self.text_finalized = True
+        self._clear_wait_catchup_state()
         self._refresh_pending_from_all_text_ids()
 
     def is_waiting_text(self) -> bool:
@@ -2287,7 +2338,11 @@ class IncrementalCustomVoiceSession:
             "finalized": self.text_finalized,
             "eos_reached": self.eos_reached,
             "waiting_text": self.waiting_text,
+            "paused_for_text": self.paused_for_text,
             "total_text_tokens": len(self.all_text_ids),
+            "catchup_steps_total": self._catchup_steps_total,
+            "catchup_steps_current_wait": self._catchup_steps_current_wait,
+            "wait_pause_step_target": self._wait_pause_step_target,
         }
 
     def pump(
@@ -2304,6 +2359,9 @@ class IncrementalCustomVoiceSession:
         if self.next_input_embeds is None:
             self._bootstrap_if_ready()
             if self.next_input_embeds is None:
+                if self.waiting_text:
+                    # Flush any buffered tail so pause mode does not hide short chunks.
+                    yield from self._emit_remaining_chunks(is_final_chunk=False)
                 return
 
         steps = 0
@@ -2319,12 +2377,16 @@ class IncrementalCustomVoiceSession:
                 break
 
             self.generated_codes.append(all_codes)
+            self._generated_first_code_tokens.append(int(all_codes[0, 0]))
             steps += 1
 
             yield from self._emit_progress_chunks()
             self._prepare_next_input(codec_embed)
 
             if self.waiting_text:
+                if self.next_input_embeds is None:
+                    # Hard-pause mode: emit remainder before returning to caller.
+                    yield from self._emit_remaining_chunks(is_final_chunk=False)
                 break
 
     def _validate_committed_prefix(self, new_token_ids: List[int]) -> None:
@@ -2372,15 +2434,20 @@ class IncrementalCustomVoiceSession:
 
         first_text_embed = self._consume_next_text_embed()
         if first_text_embed is None:
+            self._clear_wait_catchup_state()
             if self.text_finalized and len(self.all_text_ids) == 0:
                 # Empty finalized input yields no speech.
                 self.eos_reached = True
                 self.waiting_text = False
+                self.paused_for_text = False
             else:
                 self.waiting_text = True
+                self.paused_for_text = True
             return
 
+        self._clear_wait_catchup_state()
         self.waiting_text = False
+        self.paused_for_text = False
         self.next_input_embeds = mx.concatenate(
             [self._prefill_prefix, first_text_embed + self._codec_suffix], axis=1
         )
@@ -2396,9 +2463,11 @@ class IncrementalCustomVoiceSession:
         if text_embed is None:
             return
 
+        self._clear_wait_catchup_state()
         self.next_input_embeds = text_embed + self._next_codec_embed
         mx.eval(self.next_input_embeds)
         self.waiting_text = False
+        self.paused_for_text = False
 
     def _run_codec_step(self) -> Tuple[Optional[mx.array], Optional[mx.array]]:
         if self.next_input_embeds is None:
@@ -2408,6 +2477,25 @@ class IncrementalCustomVoiceSession:
             return None, None
 
         logits, hidden = self.model.talker(self.next_input_embeds, cache=self.cache)
+
+        # Enforce append-only session semantics:
+        # before finalize + eos-text consumption, EOS is not allowed.
+        allow_audio_eos = self.text_finalized and self._eos_text_consumed
+        suppress_tokens = list(self._suppress_tokens_list)
+        eos_token_id = self._config.codec_eos_token_id
+        for token_id in (
+            getattr(self._config, "codec_pad_id", None),
+            getattr(self._config, "codec_bos_id", None),
+        ):
+            if token_id is None:
+                continue
+            token_id = int(token_id)
+            if token_id != eos_token_id and token_id not in suppress_tokens:
+                suppress_tokens.append(token_id)
+        eos_for_sampling = eos_token_id if allow_audio_eos else None
+        if not allow_audio_eos:
+            suppress_tokens.append(eos_token_id)
+
         next_token = self.model._sample_token(
             logits,
             temperature=self.temperature,
@@ -2415,15 +2503,15 @@ class IncrementalCustomVoiceSession:
             top_p=self.top_p,
             repetition_penalty=self.repetition_penalty,
             generated_tokens=(
-                [int(c[0, 0]) for c in self.generated_codes]
-                if self.generated_codes
+                self._generated_first_code_tokens
+                if self._generated_first_code_tokens
                 else None
             ),
-            suppress_tokens=self._suppress_tokens.tolist(),
-            eos_token_id=self._config.codec_eos_token_id,
+            suppress_tokens=suppress_tokens,
+            eos_token_id=eos_for_sampling,
         )
 
-        if int(next_token[0, 0]) == self._config.codec_eos_token_id:
+        if allow_audio_eos and int(next_token[0, 0]) == eos_token_id:
             self.eos_reached = True
             return None, None
 
@@ -2470,14 +2558,70 @@ class IncrementalCustomVoiceSession:
     def _prepare_next_input(self, codec_embed: mx.array) -> None:
         text_embed = self._consume_next_text_embed()
         if text_embed is None:
-            text_embed = self._tts_pad_embed
-            self.waiting_text = not self.text_finalized
+            if not self.text_finalized and self.waiting_text_strategy == "pause":
+                self._enter_waiting_pause(codec_embed)
+                return
+            if (
+                not self.text_finalized
+                and self.waiting_text_strategy == "pause_catchup"
+            ):
+                if self._wait_pause_step_target is None:
+                    target = int(
+                        math.ceil(
+                            self.consumed_text_tokens
+                            * self.catchup_target_codec_per_text
+                        )
+                    )
+                    lag = max(0, target - self._codec_steps_generated)
+                    budget = min(self.catchup_max_steps_per_wait, lag)
+                    self._wait_pause_start_step = self._codec_steps_generated
+                    self._wait_pause_step_target = self._codec_steps_generated + budget
+                    self._catchup_steps_current_wait = 0
+
+                if self._wait_pause_start_step is not None:
+                    completed = max(
+                        0, self._codec_steps_generated - self._wait_pause_start_step
+                    )
+                    if completed > self._catchup_steps_current_wait:
+                        self._catchup_steps_total += (
+                            completed - self._catchup_steps_current_wait
+                        )
+                        self._catchup_steps_current_wait = completed
+
+                if (
+                    self._wait_pause_step_target is not None
+                    and self._codec_steps_generated >= self._wait_pause_step_target
+                ):
+                    self._enter_waiting_pause(codec_embed)
+                    return
+
+                text_embed = self._tts_pad_embed
+                self.waiting_text = False
+                self.paused_for_text = False
+            else:
+                text_embed = self._tts_pad_embed
+                self.waiting_text = not self.text_finalized
+                self.paused_for_text = False
+                self._clear_wait_catchup_state()
         else:
+            self._clear_wait_catchup_state()
             self.waiting_text = False
+            self.paused_for_text = False
 
         self._next_codec_embed = codec_embed
         self.next_input_embeds = text_embed + codec_embed
         mx.eval(self.next_input_embeds)
+
+    def _enter_waiting_pause(self, codec_embed: mx.array) -> None:
+        self._next_codec_embed = codec_embed
+        self.next_input_embeds = None
+        self.waiting_text = True
+        self.paused_for_text = True
+
+    def _clear_wait_catchup_state(self) -> None:
+        self._wait_pause_step_target = None
+        self._wait_pause_start_step = None
+        self._catchup_steps_current_wait = 0
 
     def _emit_progress_chunks(self) -> Generator[GenerationResult, None, None]:
         new_tokens = len(self.generated_codes) - self.decoded_tokens

@@ -395,6 +395,8 @@ class _FakeIncrementalModel:
         tokenization_map: dict,
         primary_tokens: list[int],
         eos_token_id: int = 63,
+        codec_pad_id: int = 60,
+        codec_bos_id: int = 61,
         num_code_groups: int = 2,
         hidden_size: int = 8,
         vocab_size: int = 64,
@@ -407,6 +409,8 @@ class _FakeIncrementalModel:
         self.config = SimpleNamespace(
             talker_config=SimpleNamespace(
                 codec_eos_token_id=eos_token_id,
+                codec_pad_id=codec_pad_id,
+                codec_bos_id=codec_bos_id,
                 num_code_groups=num_code_groups,
                 vocab_size=vocab_size,
             )
@@ -447,10 +451,19 @@ class _FakeIncrementalModel:
 
     def _sample_token(self, logits: mx.array, suppress_tokens=None, eos_token_id=None, **_):
         if suppress_tokens is not None:
-            if self._primary_tokens:
-                token = self._primary_tokens.pop(0)
-            else:
-                token = eos_token_id
+            suppressed = set(int(t) for t in suppress_tokens)
+            token = None
+            while self._primary_tokens:
+                candidate = int(self._primary_tokens.pop(0))
+                if candidate in suppressed:
+                    continue
+                token = candidate
+                break
+            if token is None:
+                if eos_token_id is not None and int(eos_token_id) not in suppressed:
+                    token = int(eos_token_id)
+                else:
+                    token = int(self._secondary_token)
             return mx.array([[token]], dtype=mx.int32)
         return mx.array([[self._secondary_token]], dtype=mx.int32)
 
@@ -461,12 +474,22 @@ class _FakeIncrementalModel:
 
 
 class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
-    def _new_session(self, model: _FakeIncrementalModel, stable_tail_tokens: int = 1):
+    def _new_session(
+        self,
+        model: _FakeIncrementalModel,
+        stable_tail_tokens: int = 1,
+        waiting_text_strategy: str = "pause",
+        catchup_target_codec_per_text: float = 2.0,
+        catchup_max_steps_per_wait: int = 2,
+    ):
         return IncrementalCustomVoiceSession(
             model=model,
             speaker="vivian",
             stable_tail_tokens=stable_tail_tokens,
             streaming_interval=0.08,  # Force 1 token streaming chunks in tests.
+            waiting_text_strategy=waiting_text_strategy,
+            catchup_target_codec_per_text=catchup_target_codec_per_text,
+            catchup_max_steps_per_wait=catchup_max_steps_per_wait,
             max_codec_steps_total=32,
         )
 
@@ -485,6 +508,7 @@ class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
         first_results = list(session.pump(max_codec_steps=1))
         self.assertEqual(len(first_results), 1)
         self.assertTrue(session.is_waiting_text())
+        self.assertTrue(session.status()["paused_for_text"])
         self.assertEqual(session.status()["consumed_text_tokens"], 1)
 
         first_hashes = [hash(np.array(r.audio).tobytes()) for r in first_results]
@@ -493,6 +517,7 @@ class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
         second_results = list(session.pump(max_codec_steps=1))
         self.assertEqual(len(second_results), 1)
         self.assertFalse(session.is_waiting_text())
+        self.assertFalse(session.status()["paused_for_text"])
         self.assertEqual(
             first_hashes, [hash(np.array(r.audio).tobytes()) for r in first_results]
         )
@@ -559,6 +584,310 @@ class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
         session.append_text("b")
         resumed = list(session.pump(max_codec_steps=1))
         self.assertEqual(len(resumed), 1)
+        self.assertTrue(session.status()["paused_for_text"])
+
+    def test_pause_strategy_does_not_advance_codec_while_waiting(self):
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[11, 12, 13, 14],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=1))
+        self.assertTrue(session.is_waiting_text())
+        self.assertTrue(session.status()["paused_for_text"])
+
+        before = len(session.generated_codes)
+        list(session.pump(max_codec_steps=3))
+        after = len(session.generated_codes)
+        self.assertEqual(before, after)
+        self.assertTrue(session.is_waiting_text())
+        self.assertTrue(session.status()["paused_for_text"])
+
+    def test_pause_strategy_resumes_without_cache_reset(self):
+        tokenization_map = {
+            "A": [10, 11],
+            "AB": [10, 11, 12, 13],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[21, 22, 23, 24, 25],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=1))
+        cache_id = id(session.cache)
+        self.assertTrue(session.is_waiting_text())
+        self.assertTrue(session.status()["paused_for_text"])
+
+        session.append_text("B")
+        resumed = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(cache_id, id(session.cache))
+        self.assertFalse(session.status()["paused_for_text"])
+
+    def test_pad_strategy_keeps_backward_compatible_waiting_drive(self):
+        tokenization_map = {
+            "A": [31, 32],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[41, 42, 43, 44],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pad",
+        )
+
+        list(session.pump(max_codec_steps=1))
+        session.append_text("A")
+        list(session.pump(max_codec_steps=1))
+        self.assertTrue(session.is_waiting_text())
+        self.assertFalse(session.status()["paused_for_text"])
+        before = len(session.generated_codes)
+        second = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(second), 1)
+        self.assertEqual(len(session.generated_codes), before + 1)
+
+    def test_pause_catchup_advances_within_budget_then_hard_pauses(self):
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[31, 32, 33, 34, 35],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause_catchup",
+            catchup_target_codec_per_text=10.0,
+            catchup_max_steps_per_wait=2,
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=16))
+        self.assertTrue(session.is_waiting_text())
+        self.assertTrue(session.status()["paused_for_text"])
+        self.assertEqual(len(session.generated_codes), 3)  # 1 text step + 2 catchup steps
+        self.assertEqual(session.status()["catchup_steps_total"], 2)
+        self.assertEqual(session.status()["catchup_steps_current_wait"], 2)
+        self.assertEqual(session.status()["wait_pause_step_target"], 3)
+
+    def test_pause_catchup_lag_zero_pauses_immediately(self):
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[41, 42, 43],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause_catchup",
+            catchup_target_codec_per_text=0.5,
+            catchup_max_steps_per_wait=2,
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=8))
+        self.assertTrue(session.is_waiting_text())
+        self.assertEqual(len(session.generated_codes), 1)
+        self.assertEqual(session.status()["catchup_steps_total"], 0)
+        self.assertEqual(session.status()["catchup_steps_current_wait"], 0)
+        self.assertEqual(session.status()["wait_pause_step_target"], 1)
+
+    def test_pause_catchup_resumes_without_cache_reset(self):
+        tokenization_map = {
+            "A": [10, 11],
+            "AB": [10, 11, 12, 13],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[51, 52, 53, 54, 55],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause_catchup",
+            catchup_target_codec_per_text=10.0,
+            catchup_max_steps_per_wait=2,
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=8))
+        cache_id = id(session.cache)
+        self.assertTrue(session.is_waiting_text())
+
+        session.append_text("B")
+        resumed = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(cache_id, id(session.cache))
+        self.assertFalse(session.status()["paused_for_text"])
+        self.assertIsNone(session.status()["wait_pause_step_target"])
+        self.assertEqual(session.status()["catchup_steps_current_wait"], 0)
+
+    def test_pause_catchup_waiting_pump_does_not_emit_duplicate_chunks(self):
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[61, 62, 63, 64, 65],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause_catchup",
+            catchup_target_codec_per_text=10.0,
+            catchup_max_steps_per_wait=2,
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=16))
+        self.assertTrue(session.is_waiting_text())
+
+        decoded_before = session.decoded_tokens
+        generated_before = len(session.generated_codes)
+        second = list(session.pump(max_codec_steps=3))
+        self.assertEqual(second, [])
+        self.assertEqual(decoded_before, session.decoded_tokens)
+        self.assertEqual(generated_before, len(session.generated_codes))
+
+    def test_waiting_pump_does_not_emit_duplicate_chunks(self):
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[61, 62, 63],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        first = list(session.pump(max_codec_steps=1))
+        self.assertEqual(len(first), 1)
+        self.assertTrue(session.is_waiting_text())
+
+        decoded_before = session.decoded_tokens
+        generated_before = len(session.generated_codes)
+
+        second = list(session.pump(max_codec_steps=3))
+        self.assertEqual(second, [])
+        self.assertEqual(decoded_before, session.decoded_tokens)
+        self.assertEqual(generated_before, len(session.generated_codes))
+
+    def test_stable_tail_defers_last_token_to_next_append(self):
+        tokenization_map = {
+            "A": [11, 12],
+            "AB": [11, 12, 13],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[71, 72, 73, 63],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=1))
+        self.assertEqual(session.consumed_text_tokens, 1)
+        self.assertEqual(session.all_text_ids, [11, 12])
+
+        session.append_text("B")
+        self.assertGreaterEqual(len(session._pending_token_ids), 1)
+        self.assertEqual(session._pending_token_ids[0], 12)
+
+    def test_stable_tail_zero_consumes_all_tokens_without_deferral(self):
+        tokenization_map = {
+            "A": [21, 22],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[91, 92, 63],
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=0,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=2))
+        self.assertEqual(session.consumed_text_tokens, 2)
+        self.assertEqual(session.status()["pending_tokens"], 0)
+        self.assertTrue(session.is_waiting_text())
+
+    def test_first_codebook_sampling_suppresses_codec_pad_and_bos(self):
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[60, 61, 45, 63],
+            codec_pad_id=60,
+            codec_bos_id=61,
+            eos_token_id=63,
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=1))
+        self.assertEqual(int(session.generated_codes[0][0, 0]), 45)
+
+    def test_eos_is_blocked_before_finalize_and_allowed_after_finalize(self):
+        eos = 63
+        tokenization_map = {
+            "A": [1, 2],
+        }
+        model = _FakeIncrementalModel(
+            tokenization_map=tokenization_map,
+            primary_tokens=[eos, 81, eos],
+            eos_token_id=eos,
+        )
+        session = self._new_session(
+            model,
+            stable_tail_tokens=1,
+            waiting_text_strategy="pause",
+        )
+
+        session.append_text("A")
+        list(session.pump(max_codec_steps=1))
+        self.assertFalse(session.is_finished())
+        self.assertEqual(int(session.generated_codes[0][0, 0]), 81)
+
+        session.finalize_text()
+        for _ in range(8):
+            if session.is_finished():
+                break
+            list(session.pump(max_codec_steps=1))
+        self.assertTrue(session.is_finished())
 
     def test_generate_custom_voice_incremental_wrapper(self):
         class _MockSession:
@@ -600,6 +929,9 @@ class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
                 fake_model,
                 text_chunks=["first", "second"],
                 speaker="vivian",
+                waiting_text_strategy="pad",
+                catchup_target_codec_per_text=2.5,
+                catchup_max_steps_per_wait=4,
             )
         )
 
@@ -607,6 +939,24 @@ class TestQwen3TTSIncrementalCustomVoiceSession(unittest.TestCase):
         self.assertEqual(mock_session.appended, ["first", "second"])
         self.assertTrue(mock_session.finalized)
         fake_model.start_custom_voice_session.assert_called_once()
+        self.assertEqual(
+            fake_model.start_custom_voice_session.call_args.kwargs[
+                "waiting_text_strategy"
+            ],
+            "pad",
+        )
+        self.assertEqual(
+            fake_model.start_custom_voice_session.call_args.kwargs[
+                "catchup_target_codec_per_text"
+            ],
+            2.5,
+        )
+        self.assertEqual(
+            fake_model.start_custom_voice_session.call_args.kwargs[
+                "catchup_max_steps_per_wait"
+            ],
+            4,
+        )
 
     def test_generate_custom_voice_compatibility_smoke(self):
         fake_model = SimpleNamespace(
