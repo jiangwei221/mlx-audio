@@ -272,6 +272,112 @@ class Model(nn.Module):
         """Get list of supported language codes."""
         return self.supported_languages
 
+    def _tokenize_incremental_body(self, text: str) -> List[int]:
+        """Return assistant-body ids without relying on fixed template slices."""
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+        prefix = "<|im_start|>assistant\n"
+        suffix = "<|im_end|>\n<|im_start|>assistant\n"
+        prefix_ids = self.tokenizer.encode(prefix)
+        suffix_ids = self.tokenizer.encode(suffix)
+        ids = self.tokenizer.encode(prefix + text + suffix)
+        if ids[: len(prefix_ids)] != prefix_ids or ids[-len(suffix_ids) :] != suffix_ids:
+            raise ValueError("Qwen chat-template tokenization changed unexpectedly")
+        return list(ids[len(prefix_ids) : -len(suffix_ids)])
+
+    def _tokenize_incremental_body_with_offsets(self, text: str):
+        """Tokenize only the assistant body, preserving text-relative offsets."""
+        from .text_commit import TokenEncoding, TokenizerOffsetError
+
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+        prefix = "<|im_start|>assistant\n"
+        suffix = "<|im_end|>\n<|im_start|>assistant\n"
+        chat_text = prefix + text + suffix
+        try:
+            encoded = self.tokenizer(
+                chat_text, add_special_tokens=False, return_offsets_mapping=True
+            )
+            token_ids = encoded["input_ids"]
+            offsets = encoded["offset_mapping"]
+        except (NotImplementedError, TypeError, KeyError) as exc:
+            raise TokenizerOffsetError(
+                "Qwen incremental streaming requires a fast tokenizer with offsets"
+            ) from exc
+        body_start, body_end = len(prefix), len(prefix) + len(text)
+        body_ids, body_offsets = [], []
+        for token_id, (start, end) in zip(token_ids, offsets):
+            if start >= body_start and end <= body_end and end > start:
+                body_ids.append(int(token_id))
+                body_offsets.append((start - body_start, end - body_start))
+        return TokenEncoding(tuple(body_ids), tuple(body_offsets))
+
+    def _embed_incremental_body(self, token_ids: List[int]) -> List[mx.array]:
+        if not token_ids:
+            return []
+        values = mx.array([token_ids], dtype=mx.int32)
+        embeds = self.talker.text_projection(self.talker.get_text_embeddings()(values))
+        mx.eval(embeds)
+        return [embeds[:, index : index + 1, :] for index in range(embeds.shape[1])]
+
+    def _build_incremental_custom_voice_context(
+        self, speaker: str, language: str, instruct: Optional[str]
+    ) -> Dict[str, mx.array]:
+        """Build the immutable prompt portion for one CustomVoice session."""
+        config = self.config.talker_config
+        speaker_key = speaker.lower()
+        if speaker_key not in (config.spk_id or {}):
+            raise ValueError(f"Unsupported speaker: {speaker}")
+        language_id = (config.codec_language_id or {}).get(language.lower())
+        if language.lower() == "auto":
+            language_id = None
+        if language_id is None:
+            prefill_ids = [config.codec_nothink_id, config.codec_think_bos_id, config.codec_think_eos_id]
+        else:
+            prefill_ids = [config.codec_think_id, config.codec_think_bos_id, language_id, config.codec_think_eos_id]
+        tts_tokens = mx.array([[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]])
+        tts = self.talker.text_projection(self.talker.get_text_embeddings()(tts_tokens))
+        codec = self.talker.get_input_embeddings()(mx.array([prefill_ids]))
+        speaker_embed = self.talker.get_input_embeddings()(mx.array([[config.spk_id[speaker_key]]]))
+        suffix = self.talker.get_input_embeddings()(mx.array([[config.codec_pad_id, config.codec_bos_id]]))
+        codec = mx.concatenate([codec, speaker_embed, suffix], axis=1)
+        pad_count = codec.shape[1] - 2
+        pads = mx.broadcast_to(tts[:, 2:3, :], (1, pad_count, tts.shape[-1]))
+        codec_prefix = mx.concatenate([pads, tts[:, 0:1, :]], axis=1) + codec[:, :-1, :]
+        role = self.talker.text_projection(self.talker.get_text_embeddings()(mx.array([self.tokenizer.encode("<|im_start|>assistant\n")])))
+        parts = [role, codec_prefix]
+        if instruct:
+            instruct_ids = mx.array([self.tokenizer.encode(f"<|im_start|>user\n{instruct}<|im_end|>\n")])
+            parts.insert(0, self.talker.text_projection(self.talker.get_text_embeddings()(instruct_ids)))
+        return {"prefill_prefix": mx.concatenate(parts, axis=1), "codec_suffix": codec[:, -1:, :], "tts_eos_embed": tts[:, 1:2, :], "tts_pad_embed": tts[:, 2:3, :]}
+
+    def start_custom_voice_session(
+        self, speaker: str, language: str = "auto", instruct: Optional[str] = None,
+        commit_policy: str = "safe_sentence", streaming_interval: float = 0.32,
+        temperature: float = 0.9, top_k: int = 50, top_p: float = 1.0,
+        repetition_penalty: float = 1.05, max_codec_steps_total: int = 4096,
+    ):
+        """Create a single-owner, append-only CustomVoice text session."""
+        if self.config.tts_model_type != "custom_voice":
+            raise ValueError("Incremental sessions require a CustomVoice model")
+        if self.speech_tokenizer is None:
+            raise ValueError("Speech tokenizer not loaded")
+        from .incremental import IncrementalCustomVoiceSession
+        return IncrementalCustomVoiceSession(self, speaker, language, instruct, commit_policy, streaming_interval, temperature, top_k, top_p, repetition_penalty, max_codec_steps_total)
+
+    def generate_custom_voice_incremental(self, text_chunks, speaker: str, **kwargs):
+        """Synchronously synthesize an iterable of LLM text deltas."""
+        session = self.start_custom_voice_session(speaker=speaker, **kwargs)
+        try:
+            for chunk in [text_chunks] if isinstance(text_chunks, str) else text_chunks:
+                session.append_text(chunk)
+                yield from session.pump()
+            session.finalize_text()
+            while not session.is_finished():
+                yield from session.pump()
+        finally:
+            session.close()
+
     def model_quant_predicate(self, path: str, module) -> bool:
 
         skip_patterns = [
