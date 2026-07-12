@@ -38,7 +38,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from huggingface_hub.errors import RepositoryNotFoundError
 from pydantic import BaseModel
 
@@ -184,6 +184,18 @@ class SpeechRequest(BaseModel):
     streaming_interval: float = 2.0
     max_tokens: int = 1200
     verbose: bool = False
+
+
+class IncrementalSpeechDemoRequest(BaseModel):
+    """Local browser demo for one Qwen3 CustomVoice text stream."""
+
+    model: str
+    voice: str = "Ryan"
+    language: str = "English"
+    chunks: list[str]
+    commit_policy: str = "safe_sentence"
+    streaming_interval: float = 0.24
+    temperature: float = 0.0
 
 
 class TranscriptionRequest(BaseModel):
@@ -873,6 +885,15 @@ async def root():
     }
 
 
+@app.get("/demo/qwen3-tts-stream", include_in_schema=False)
+async def qwen3_tts_stream_demo():
+    """Serve the no-build browser demo for incremental Qwen3-TTS."""
+    return FileResponse(
+        Path(__file__).parent / "tts" / "static" / "qwen3_tts_stream_demo.html",
+        media_type="text/html",
+    )
+
+
 @app.get("/v1/models")
 async def list_models():
     """
@@ -953,6 +974,56 @@ async def tts_speech(payload: SpeechRequest, request: Request):
         media_type=f"audio/{payload.response_format}",
         headers={
             "Content-Disposition": f"attachment; filename=speech.{payload.response_format}"
+        },
+    )
+
+
+@app.post("/v1/audio/speech/incremental-demo")
+async def incremental_tts_demo(payload: IncrementalSpeechDemoRequest):
+    """Stream f32le PCM from the local Qwen3 incremental-session implementation.
+
+    This endpoint is deliberately a small single-session diagnostic tool, not
+    an OpenAI-compatible API.  It lets the companion HTML page exercise the
+    same append/pause/finalize path used by an LLM text stream.
+    """
+    await _preflight_model_load(payload.model)
+    model = _load_model_for_inference(payload.model)
+    if not hasattr(model, "start_custom_voice_session"):
+        raise HTTPException(
+            status_code=400,
+            detail="This demo requires the local Qwen3-TTS CustomVoice model.",
+        )
+    if not payload.chunks or not all(isinstance(chunk, str) for chunk in payload.chunks):
+        raise HTTPException(status_code=400, detail="chunks must contain text deltas")
+
+    def pcm_chunks():
+        session = model.start_custom_voice_session(
+            speaker=payload.voice,
+            language=payload.language,
+            commit_policy=payload.commit_policy,
+            streaming_interval=payload.streaming_interval,
+            temperature=payload.temperature,
+        )
+        try:
+            for text_delta in payload.chunks:
+                session.append_text(text_delta)
+                for result in session.pump():
+                    yield np.asarray(result.audio, dtype=np.float32).tobytes()
+            session.finalize_text()
+            while not session.is_finished():
+                for result in session.pump(max_codec_steps=8):
+                    yield np.asarray(result.audio, dtype=np.float32).tobytes()
+        finally:
+            session.close()
+
+    return StreamingResponse(
+        pcm_chunks(),
+        media_type="application/octet-stream",
+        headers={
+            "X-Audio-Format": "f32le",
+            "X-Audio-Sample-Rate": str(getattr(model, "sample_rate", 24000)),
+            "X-Audio-Channels": "1",
+            "Cache-Control": "no-store",
         },
     )
 
